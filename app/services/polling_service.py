@@ -5,52 +5,56 @@ from fastapi import HTTPException
 from app.db import db
 
 
-import pandas as pd
-from datetime import datetime, timedelta
-from fastapi import HTTPException
-from bson import ObjectId
-
 async def generate_filtered_data_table(store_id: int):
     try:
         # Load business hours for the store
         business_hours = pd.read_csv("data/business_hours.csv")
         
-        # Fetch the latest polling data for the store from latest_polling_data
+        # Fetch the latest polling data for the store
         latest_polling_record = db.latest_polling_data.find_one({"store_id": store_id})
 
+        # If no latest polling record is found, return an empty result
         if not latest_polling_record:
-            raise HTTPException(status_code=404, detail="No latest polling data found for the store.")
+            return {
+                "store_id": store_id,
+                "filtered_data_table": []
+            }
 
         # Extract the latest timestamp local time and convert to datetime object
         latest_time_str = latest_polling_record['timestamp_local']
+        latest_day_of_week = int(latest_polling_record['day_of_week'])
         latest_timestamp_local = datetime.strptime(latest_time_str, '%H:%M:%S').time()
         one_hour_ago = (datetime.combine(datetime.today(), latest_timestamp_local) - timedelta(hours=1)).time()
 
-        print("Latest", one_hour_ago)
-
-        # Fetch all polling data for the store from all_polling_data within the last hour
+        # Fetch all polling data for the store from all_polling_data within the last hour and specific day
         data_cursor = db.all_polling_data.find({
             "store_id": store_id,
+            "day_of_week": latest_day_of_week,
             "timestamp_local": {"$gte": one_hour_ago.strftime('%H:%M:%S'), "$lte": latest_timestamp_local.strftime('%H:%M:%S')}
         }).sort("timestamp_local", 1)
 
         # Convert cursor to list and exclude ObjectId for debugging/logging
         polling_data = [{k: v for k, v in record.items() if k != '_id'} for record in data_cursor]
-        print("poll", polling_data)
         
+        # If no polling data found within the last hour, return an empty result
         if not polling_data:
-            raise HTTPException(status_code=404, detail="No polling data found within the last hour.")
+            return {
+                "store_id": store_id,
+                "filtered_data_table": []
+            }
 
         # Get the business hours for the specific day of the week
-        print("buz", business_hours)
-        print("buz", latest_polling_record)
         store_business_hours = business_hours.loc[
             (business_hours['store_id'] == store_id) &
-            (business_hours['day_of_week'] == latest_polling_record['day_of_week'])
+            (business_hours['day_of_week'] == latest_day_of_week)
         ]
-
+        
+        # If no business hours found for this store on the specified day, return an empty result
         if store_business_hours.empty:
-            raise HTTPException(status_code=404, detail="No business hours found for this store on the specified day.")
+            return {
+                "store_id": store_id,
+                "filtered_data_table": []
+            }
 
         # Extract business hours start and end time
         business_start = datetime.strptime(store_business_hours.iloc[0]['start_time_local'], '%H:%M:%S').time()
@@ -62,8 +66,20 @@ async def generate_filtered_data_table(store_id: int):
             if business_start <= datetime.strptime(record['timestamp_local'], '%H:%M:%S').time() <= business_end
         ]
 
-        if not polling_data_in_business_hours:
-            raise HTTPException(status_code=404, detail="No polling data within business hours for the last hour.")
+        # Prepare the records to be inserted into MongoDB
+        uptime_last_hour_records = [
+            {
+                "store_id": store_id,
+                "day_of_week": latest_day_of_week,
+                "timestamp_local": record['timestamp_local'],
+                "status": record.get('status', 'unknown')  # Assuming 'status' field is present; default to 'unknown'
+            }
+            for record in polling_data_in_business_hours
+        ]
+
+        # Store only records that meet all conditions in MongoDB
+        if uptime_last_hour_records:
+            db.uptime_last_hour_records.insert_many(uptime_last_hour_records)
 
         return {
             "store_id": store_id,
@@ -71,9 +87,10 @@ async def generate_filtered_data_table(store_id: int):
         }
 
     except Exception as e:
+        # Print error message and raise HTTPException with a generic internal server error
         print(f"Error: {e}")
         raise HTTPException(status_code=500, detail="Internal Server Error")
-
+# make a table for this filtered records as uptime_last_hour_records which will contain store_id,day_of_week,timestamp_local,status of all the store_ids and store it in mongodb
 
 async def process_all_polling_data():
     try:
