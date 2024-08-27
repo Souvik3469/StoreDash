@@ -3,9 +3,12 @@ import pytz
 import pandas as pd
 from fastapi import HTTPException
 from app.db import db
+from bson import ObjectId
+import random
+import string
 
 
-async def generate_filtered_data_table(store_id: int):
+async def generate_filtered_data_table_last_hour(store_id: int):
     try:
         # Load business hours for the store
         business_hours = pd.read_csv("data/business_hours.csv")
@@ -67,7 +70,7 @@ async def generate_filtered_data_table(store_id: int):
         ]
 
         # Prepare the records to be inserted into MongoDB
-        uptime_last_hour_records = [
+        last_hour_records = [
             {
                 "store_id": store_id,
                 "day_of_week": latest_day_of_week,
@@ -78,8 +81,8 @@ async def generate_filtered_data_table(store_id: int):
         ]
 
         # Store only records that meet all conditions in MongoDB
-        if uptime_last_hour_records:
-            db.uptime_last_hour_records.insert_many(uptime_last_hour_records)
+        if last_hour_records:
+            db.last_hour_records.insert_many(last_hour_records)
 
         return {
             "store_id": store_id,
@@ -90,8 +93,399 @@ async def generate_filtered_data_table(store_id: int):
         # Print error message and raise HTTPException with a generic internal server error
         print(f"Error: {e}")
         raise HTTPException(status_code=500, detail="Internal Server Error")
-# make a table for this filtered records as uptime_last_hour_records which will contain store_id,day_of_week,timestamp_local,status of all the store_ids and store it in mongodb
 
+async def generate_filtered_data_table_last_day(store_id: int):
+    try:
+        # Load business hours for the store
+        business_hours = pd.read_csv("data/business_hours.csv")
+        # print("Loaded business hours:\n", business_hours)
+        
+        # Fetch the latest polling data for the store
+        latest_polling_record = db.latest_polling_data.find_one({"store_id": store_id})
+
+        # If no latest polling record is found, return an empty result
+        if not latest_polling_record:
+            # print(f"No latest polling record found for store_id: {store_id}")
+            return {
+                "store_id": store_id,
+                "filtered_data_table": []
+            }
+
+        # Extract the latest timestamp local time and convert to datetime object
+        latest_time_str = latest_polling_record['timestamp_local']
+        latest_day_of_week = int(latest_polling_record['day_of_week'])
+        latest_timestamp_local = datetime.strptime(latest_time_str, '%H:%M:%S').time()
+        # print(f"Latest timestamp: {latest_time_str}, Day of Week: {latest_day_of_week}")
+
+        # Calculate the start time 24 hours earlier
+        previous_day_of_week = (latest_day_of_week - 1) % 7
+        latest_datetime = datetime.combine(datetime.today(), latest_timestamp_local)
+        start_datetime = latest_datetime - timedelta(days=1)
+        start_time_local = start_datetime.time()
+        # print(f"Start time: {start_time_local.strftime('%H:%M:%S')}, Previous Day of Week: {previous_day_of_week}")
+
+        # Fetch all polling data for the store from all_polling_data within the calculated time range
+        data_cursor = db.all_polling_data.find({
+            "store_id": store_id,
+            "$or": [
+                {
+                    "day_of_week": latest_day_of_week,
+                    "timestamp_local": {"$lte": latest_timestamp_local.strftime('%H:%M:%S')}
+                },
+                {
+                    "day_of_week": previous_day_of_week,
+                    "timestamp_local": {"$gte": start_time_local.strftime('%H:%M:%S')}
+                }
+            ]
+        }).sort("timestamp_local", 1)
+
+        # Convert cursor to list and exclude ObjectId for debugging/logging
+        polling_data = [{k: v for k, v in record.items() if k != '_id'} for record in data_cursor]
+        # print("Fetched polling data:\n", polling_data)
+        
+        # If no polling data found within the calculated range, return an empty result
+        if not polling_data:
+            print("No polling data found within the calculated range.")
+            return {
+                "store_id": store_id,
+                "filtered_data_table": []
+            }
+
+        # Get business hours for the specific days of the week
+        store_business_hours = business_hours[
+            (business_hours['store_id'] == store_id) &
+            (business_hours['day_of_week'].isin([previous_day_of_week, latest_day_of_week]))
+        ]
+        # print("Business hours for the store:\n", store_business_hours)
+        
+        # If no business hours found for this store on the specified days, return an empty result
+        if store_business_hours.empty:
+            print("No business hours found for the specified days.")
+            return {
+                "store_id": store_id,
+                "filtered_data_table": []
+            }
+
+        # Extract business hours for the two days
+        business_hours_dict = store_business_hours.set_index('day_of_week').to_dict(orient='index')
+        # print("Business hours dictionary:\n", business_hours_dict)
+        
+        def is_within_business_hours(record):
+            record_time = datetime.strptime(record['timestamp_local'], '%H:%M:%S').time()
+            record_day = int(record['day_of_week'])
+            if record_day in business_hours_dict:
+                business_start = datetime.strptime(business_hours_dict[record_day]['start_time_local'], '%H:%M:%S').time()
+                business_end = datetime.strptime(business_hours_dict[record_day]['end_time_local'], '%H:%M:%S').time()
+                # Check if record_time is within the business hours
+                within_hours = business_start <= record_time <= business_end
+                # print(f"Checking {record_time} within hours ({business_start} to {business_end}): {within_hours}")
+                return within_hours
+            return False
+        
+        # Filter polling data within business hours
+        polling_data_in_business_hours = [record for record in polling_data if is_within_business_hours(record)]
+        # print("Filtered polling data within business hours:\n", polling_data_in_business_hours)
+
+        # Prepare the records to be inserted into MongoDB
+        last_day_records = [
+            {
+                "store_id": store_id,
+                "day_of_week": int(record['day_of_week']),
+                "timestamp_local": record['timestamp_local'],
+                "status": record.get('status', 'unknown')  # Assuming 'status' field is present; default to 'unknown'
+            }
+            for record in polling_data_in_business_hours
+        ]
+
+        # Store only records that meet all conditions in MongoDB
+        if last_day_records:
+            db.last_day_records.insert_many(last_day_records)
+            # print("Inserted records into MongoDB:\n", last_day_records)
+
+        return {
+            "store_id": store_id,
+            "filtered_data_table": polling_data_in_business_hours
+        }
+
+    except Exception as e:
+        # Print error message and raise HTTPException with a generic internal server error
+        print(f"Error: {e}")
+        raise HTTPException(status_code=500, detail="Internal Server Error")
+
+
+async def calculate_uptime_downtime_last_hour(store_id: int):
+    try:
+        # Fetch the filtered data from MongoDB for the last hour
+        filtered_data_cursor = db.last_hour_records.find({"store_id": store_id}).sort("timestamp_local", 1)
+        filtered_data = [{k: v for k, v in record.items() if k != '_id'} for record in filtered_data_cursor]
+
+        if not filtered_data:
+            last_hour_records =[ {
+                "store_id": store_id,
+                "uptime_minutes": 0,
+                "downtime_minutes": 0,
+                "estimated_uptime_minutes": 0,
+                "estimated_downtime_minutes": 0,
+                "full_data": []
+            }]
+
+            if last_hour_records:
+                db.up_down_hour.insert_many(last_hour_records)
+
+
+            return {
+                "store_id": store_id,
+                "uptime_minutes": 0,
+                "downtime_minutes": 0,
+                "estimated_uptime_minutes": 0,
+                "estimated_downtime_minutes": 0,
+                "full_data": []
+            }
+
+        # Convert filtered data to DataFrame for easier manipulation
+        df = pd.DataFrame(filtered_data)
+        df['timestamp_local'] = pd.to_datetime(df['timestamp_local'], format='%H:%M:%S').dt.time
+
+        # Define a base date for time calculations
+        base_date = datetime(2000, 1, 1)  # Arbitrary base date
+
+        # Convert time to datetime for calculations
+        df['timestamp_local'] = df['timestamp_local'].apply(lambda t: datetime.combine(base_date, t))
+
+        # Ensure data is sorted by timestamp
+        df = df.sort_values(by='timestamp_local').reset_index(drop=True)
+
+        # Define the start and end of the hour
+        start_time = datetime.combine(base_date, df['timestamp_local'].iloc[0].time())
+        end_time = start_time + timedelta(hours=1)
+
+        # Create a list to hold the full dataset with estimated records
+        full_data = []
+
+        # Add the start_time if it is not in the DataFrame
+        if df['timestamp_local'].iloc[0] > start_time:
+            full_data.append({'timestamp_local': start_time, 'status': df['status'].iloc[0]})
+        
+        # Add the actual records
+        for index, row in df.iterrows():
+            full_data.append({'timestamp_local': row['timestamp_local'], 'status': row['status']})
+        
+        # Add the end_time if it is not in the DataFrame
+        if df['timestamp_local'].iloc[-1] < end_time:
+            full_data.append({'timestamp_local': end_time, 'status': df['status'].iloc[-1]})
+
+        # Convert full_data list to DataFrame
+        full_df = pd.DataFrame(full_data)
+        full_df['timestamp_local'] = pd.to_datetime(full_df['timestamp_local']).dt.time
+
+        # Convert times back to datetime for time difference calculations
+        full_df['timestamp_local'] = full_df['timestamp_local'].apply(lambda t: datetime.combine(base_date, t))
+
+        # Calculate the time differences between consecutive records
+        full_df['time_diff'] = full_df['timestamp_local'].diff().fillna(pd.Timedelta(seconds=0)).dt.total_seconds() / 60
+
+        # Calculate uptime and downtime by summing the time differences where status is 'active' or 'inactive'
+        uptime_minutes = full_df[full_df['status'] == 'active']['time_diff'].sum()
+        downtime_minutes = full_df[full_df['status'] == 'inactive']['time_diff'].sum()
+
+        # Estimate missing data
+        estimated_uptime_minutes = 0
+        estimated_downtime_minutes = 0
+
+        # Check for gaps between the first record and the start_time
+        if full_df['timestamp_local'].iloc[0] > start_time:
+            time_gap = (full_df['timestamp_local'].iloc[0] - start_time).total_seconds() / 60
+            if full_df['status'].iloc[0] == 'active':
+                estimated_uptime_minutes += time_gap
+            else:
+                estimated_downtime_minutes += time_gap
+
+        # Check for gaps between records
+        for i in range(len(full_df) - 1):
+            gap_duration = (full_df['timestamp_local'].iloc[i + 1] - full_df['timestamp_local'].iloc[i]).total_seconds() / 60
+            if full_df['status'].iloc[i] == 'active':
+                estimated_uptime_minutes += gap_duration
+            else:
+                estimated_downtime_minutes += gap_duration
+
+        # Check for gaps between the last record and end_time
+        if full_df['timestamp_local'].iloc[-1] < end_time:
+            time_gap = (end_time - full_df['timestamp_local'].iloc[-1]).total_seconds() / 60
+            if full_df['status'].iloc[-1] == 'active':
+                estimated_uptime_minutes += time_gap
+            else:
+                estimated_downtime_minutes += time_gap
+
+        # Convert timestamps to string format for the response
+        for record in full_data:
+            record['timestamp_local'] = record['timestamp_local'].strftime('%H:%M:%S')
+        
+        last_hour_records =[ {
+                "store_id": store_id,
+                "uptime_minutes": uptime_minutes,
+                "downtime_minutes": downtime_minutes,
+                "estimated_uptime_minutes": estimated_uptime_minutes,
+                "estimated_downtime_minutes": estimated_downtime_minutes,
+                "full_data": full_data
+        }]
+          
+        
+
+        # Store only records that meet all conditions in MongoDB
+        if last_hour_records:
+            db.up_down_hour.insert_many(last_hour_records)
+
+
+        return {
+            "store_id": store_id,
+            "uptime_minutes": uptime_minutes,
+            "downtime_minutes": downtime_minutes,
+            "estimated_uptime_minutes": estimated_uptime_minutes,
+            "estimated_downtime_minutes": estimated_downtime_minutes,
+            "full_data": full_data
+        }
+
+    except Exception as e:
+        print(f"Error: {e}")
+        raise HTTPException(status_code=500, detail="Internal Server Error")
+
+async def calculate_uptime_downtime_last_day(store_id: int):
+    try:
+        # Fetch the filtered data from MongoDB for the last hour
+        filtered_data_cursor = db.last_day_records.find({"store_id": store_id}).sort("timestamp_local", 1)
+        filtered_data = [{k: v for k, v in record.items() if k != '_id'} for record in filtered_data_cursor]
+
+        if not filtered_data:
+            last_day_records =[ {
+                "store_id": store_id,
+                "uptime_hours": 0,
+                "downtime_hours": 0,
+                "estimated_uptime_hours": 0,
+                "estimated_downtime_hours": 0,
+                "full_data": []
+            }]
+
+            if last_day_records:
+                db.up_down_day.insert_many(last_day_records)
+
+
+            return {
+                "store_id": store_id,
+                "uptime_hours": 0,
+                "downtime_hours": 0,
+                "estimated_uptime_hours": 0,
+                "estimated_downtime_hours": 0,
+                "full_data": []
+            }
+
+            # Convert filtered data to DataFrame
+        df = pd.DataFrame(filtered_data)
+        df['timestamp_local'] = pd.to_datetime(df['timestamp_local'], format='%H:%M:%S').dt.time
+
+        # Define a base date for time calculations
+        base_date = datetime(2000, 1, 1)  # Arbitrary base date
+
+        # Convert time to datetime for calculations
+        df['timestamp_local'] = df['timestamp_local'].apply(lambda t: datetime.combine(base_date, t))
+
+        # Ensure data is sorted by timestamp
+        df = df.sort_values(by='timestamp_local').reset_index(drop=True)
+
+        # Define the start and end of the period
+        start_time = datetime.combine(base_date, datetime.min.time())
+        end_time = start_time + timedelta(days=1)
+
+        # Create a list to hold the full dataset with estimated records
+        full_data = []
+
+        # Add the start_time if it is not in the DataFrame
+        if df['timestamp_local'].iloc[0] > start_time:
+            full_data.append({'timestamp_local': start_time, 'status': df['status'].iloc[0]})
+        
+        # Add the actual records
+        for index, row in df.iterrows():
+            full_data.append({'timestamp_local': row['timestamp_local'], 'status': row['status']})
+        
+        # Add the end_time if it is not in the DataFrame
+        if df['timestamp_local'].iloc[-1] < end_time:
+            full_data.append({'timestamp_local': end_time, 'status': df['status'].iloc[-1]})
+
+        # Convert full_data list to DataFrame
+        full_df = pd.DataFrame(full_data)
+        full_df['timestamp_local'] = pd.to_datetime(full_df['timestamp_local'])
+
+        # Calculate the time differences between consecutive records
+        full_df['time_diff'] = full_df['timestamp_local'].diff().fillna(pd.Timedelta(seconds=0)).dt.total_seconds() / 3600
+
+        # Calculate uptime and downtime by summing the time differences where status is 'active' or 'inactive'
+        uptime_hours = full_df[full_df['status'] == 'active']['time_diff'].sum()
+        downtime_hours = full_df[full_df['status'] == 'inactive']['time_diff'].sum()
+
+        # Estimate missing data
+        estimated_uptime_hours = 0
+        estimated_downtime_hours = 0
+
+        # Check for gaps between the first record and the start_time
+        if full_df['timestamp_local'].iloc[0] > start_time:
+            time_gap = (full_df['timestamp_local'].iloc[0] - start_time).total_seconds() / 3600
+            if full_df['status'].iloc[0] == 'active':
+                estimated_uptime_hours += time_gap
+            else:
+                estimated_downtime_hours += time_gap
+
+        # Check for gaps between records
+        for i in range(len(full_df) - 1):
+            gap_duration = (full_df['timestamp_local'].iloc[i + 1] - full_df['timestamp_local'].iloc[i]).total_seconds() / 3600
+            if full_df['status'].iloc[i] == 'active':
+                estimated_uptime_hours += gap_duration
+            else:
+                estimated_downtime_hours += gap_duration
+
+        # Check for gaps between the last record and end_time
+        if full_df['timestamp_local'].iloc[-1] < end_time:
+            time_gap = (end_time - full_df['timestamp_local'].iloc[-1]).total_seconds() / 3600
+            if full_df['status'].iloc[-1] == 'active':
+                estimated_uptime_hours += time_gap
+            else:
+                estimated_downtime_hours += time_gap
+
+        # Convert timestamps to string format for the response
+        for record in full_data:
+            record['timestamp_local'] = record['timestamp_local'].strftime('%H:%M:%S')
+        
+        last_day_records =[ {
+                "store_id": store_id,
+                "uptime_hours": uptime_hours,
+                "downtime_hours": downtime_hours,
+                "estimated_uptime_hours": estimated_uptime_hours,
+                "estimated_downtime_hours": estimated_downtime_hours,
+                "full_data": full_data
+        }]
+          
+        
+
+        # Store only records that meet all conditions in MongoDB
+        if last_day_records:
+            db.up_down_day.insert_many(last_day_records)
+
+
+        return {
+            "store_id": store_id,
+                "uptime_hours": uptime_hours,
+                "downtime_hours": downtime_hours,
+                "estimated_uptime_hours": estimated_uptime_hours,
+                "estimated_downtime_hours": estimated_downtime_hours,
+                "full_data": full_data
+        }
+
+    except Exception as e:
+        print(f"Error: {e}")
+        raise HTTPException(status_code=500, detail="Internal Server Error")
+    
+
+
+
+    
 async def process_all_polling_data():
     try:
         # Load CSV files
@@ -180,3 +574,59 @@ async def process_latest_polling_data():
     except Exception as e:
         print(f"Error: {e}")
         raise HTTPException(status_code=500, detail="Internal Server Error")
+
+
+async def generate_report():
+    # Ensure all data is processed
+    await process_all_polling_data()
+    await process_latest_polling_data()
+    
+    # Fetch data to generate the report
+    store_ids = [1, 2, 3]  # Replace with dynamic store IDs if needed
+    final_results = []
+
+    for store_id in store_ids:
+        # Process hourly data
+        await generate_filtered_data_table_last_hour(store_id)
+        hour_data = await calculate_uptime_downtime_last_hour(store_id)
+        
+        # Process daily data
+        await generate_filtered_data_table_last_day(store_id)
+        day_data = await calculate_uptime_downtime_last_day(store_id)
+        
+        # Extract necessary fields
+        report_entry = {
+            "store_id": store_id,
+            "uptime_last_hour": hour_data['estimated_uptime_minutes'],
+            "downtime_last_hour": hour_data['estimated_downtime_minutes'],
+            "uptime_last_day": day_data['estimated_uptime_hours'],
+            "downtime_last_day": day_data['estimated_downtime_hours']
+        }
+        
+        final_results.append(report_entry)
+    
+    # Convert final results to DataFrame
+    final_report_df = pd.DataFrame(final_results)
+    
+    # Generate a unique report ID
+    report_id = ''.join(random.choices(string.ascii_letters + string.digits, k=10))
+    
+    # Define the file path (current directory)
+    file_path = f"{report_id}.csv"
+    
+    # Save the final report as a CSV file
+    final_report_df.to_csv(file_path, index=False)
+    
+    # Save the report status to the database
+    db.reports.insert_one({"report_id": report_id, "status": "Complete", "file_path": file_path})
+    
+    return report_id
+
+async def get_report(report_id: str):
+    report = db.reports.find_one({"report_id": report_id})
+    if report:
+        if report["status"] == "Running":
+            return {"status": "Running"}
+        elif report["status"] == "Complete":
+            return {"status": "Complete", "file_path": report.get("file_path")}
+    return {"status": "Report not found"}
