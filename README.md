@@ -25,7 +25,7 @@ We will have 3 sources of data
 1. **Clone the Repository**
 
    ```bash
-   git clone https://github.com/your-username/store-status-monitoring-api.git
+   git clone https://github.com/Souvik3469/StoreDash.git
    cd StoreDash
 
 2. **Install Dependencies**
