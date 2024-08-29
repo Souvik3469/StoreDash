@@ -125,4 +125,6 @@ We will have 3 sources of data
     
     - Using all those tables the final report is created.
 
+   ![APIs](https://github.com/Souvik3469/loop/blob/main/data/apis.png)
+
    
