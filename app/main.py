@@ -7,4 +7,4 @@ app.include_router(polling.router)
 
 @app.get("/")
 async def root():
-    return {"message": "Welcome to the Restaurant Monitoring API"}
+    return {"message": "Welcome to the StoreDash"}

@@ -8,6 +8,96 @@ import random
 import string
 
 
+
+async def process_all_polling_data():
+    try:
+        # Load CSV files
+        polling_data = pd.read_csv("data/store_status.csv")
+        timezones = pd.read_csv("data/store_timezones.csv")
+
+        # Convert timestamps
+        polling_data['timestamp_utc'] = pd.to_datetime(polling_data['timestamp_utc'])
+
+        # Function to convert UTC to local time and extract the required fields
+        def convert_utc_to_local_time(utc_time, timezone_str):
+            local_tz = pytz.timezone(timezone_str)
+            local_time = utc_time.tz_convert(local_tz)
+            return local_time.strftime('%H:%M:%S'), local_time.weekday()  # Return time up to seconds and day of week
+
+        # Process data and add local time and day of week
+        def process_row(row):
+            local_time, day_of_week = convert_utc_to_local_time(
+                row['timestamp_utc'],
+                timezones.loc[timezones['store_id'] == row['store_id'], 'timezone_str'].values[0]
+            )
+            return {
+                "store_id": row['store_id'],
+                "timestamp_local": local_time,  # Only time up to seconds
+                "day_of_week": day_of_week,  # Day of the week (0=Monday, 6=Sunday)
+                "status": row['status']
+            }
+
+        # Convert all polling data
+        processed_data = polling_data.apply(process_row, axis=1)
+
+        # Insert data into MongoDB
+        for data_to_insert in processed_data:
+            result = db.all_polling_data.insert_one(data_to_insert)
+            if not result.inserted_id:
+                raise HTTPException(status_code=500, detail="Failed to insert data")
+
+        return {"message": "All data processed and stored in all_polling_data collection in MongoDB"}
+    
+    except Exception as e:
+        print(f"Error: {e}")
+        raise HTTPException(status_code=500, detail="Internal Server Error")
+
+async def process_latest_polling_data():
+    try:
+        # Load CSV files
+        polling_data = pd.read_csv("data/store_status.csv")
+        timezones = pd.read_csv("data/store_timezones.csv")
+
+        # Convert timestamps
+        polling_data['timestamp_utc'] = pd.to_datetime(polling_data['timestamp_utc'])
+
+        # Ensure only the latest timestamp is kept for each store
+        latest_polling_data = polling_data.sort_values('timestamp_utc').groupby('store_id').tail(1)
+
+        # Function to convert UTC to local time and extract the required fields
+        def convert_utc_to_local_time(utc_time, timezone_str):
+            local_tz = pytz.timezone(timezone_str)
+            local_time = utc_time.tz_convert(local_tz)
+            return local_time.strftime('%H:%M:%S'), local_time.weekday()  # Return time up to seconds and day of week
+
+        # Process data and add local time and day of week
+        def process_row(row):
+            local_time, day_of_week = convert_utc_to_local_time(
+                row['timestamp_utc'],
+                timezones.loc[timezones['store_id'] == row['store_id'], 'timezone_str'].values[0]
+            )
+            return {
+                "store_id": row['store_id'],
+                "timestamp_local": local_time,  # Only time up to seconds
+                "day_of_week": day_of_week,  # Day of the week (0=Monday, 6=Sunday)
+                "status": row['status']
+            }
+
+        # Convert only the latest polling data
+        processed_data = latest_polling_data.apply(process_row, axis=1)
+
+        # Insert data into MongoDB
+        for data_to_insert in processed_data:
+            result = db.latest_polling_data.insert_one(data_to_insert)
+            if not result.inserted_id:
+                raise HTTPException(status_code=500, detail="Failed to insert data")
+
+        return {"message": "Latest data processed and stored in latest_polling_data collection in MongoDB"}
+    
+    except Exception as e:
+        print(f"Error: {e}")
+        raise HTTPException(status_code=500, detail="Internal Server Error")
+
 async def generate_filtered_data_table_last_hour(store_id: int):
     try:
         # Load business hours for the store
@@ -211,6 +301,89 @@ async def generate_filtered_data_table_last_day(store_id: int):
         # Print error message and raise HTTPException with a generic internal server error
         print(f"Error: {e}")
         raise HTTPException(status_code=500, detail="Internal Server Error")
+    
+async def generate_filtered_data_table_last_week(store_id: int):
+    try:
+        # Load business hours for the store
+        business_hours = pd.read_csv("data/business_hours.csv")
+        
+        # Calculate the start time 7 days earlier
+        latest_day_of_week = datetime.now().weekday()
+        start_datetime = datetime.now() - timedelta(days=7)
+        start_day_of_week = start_datetime.weekday()
+        
+        # Fetch all polling data for the store within the last 7 days
+        data_cursor = db.all_polling_data.find({
+            "store_id": store_id,
+            # "$or": [
+            #     {
+            #         "day_of_week": {"$gte": start_day_of_week, "$lte": latest_day_of_week},
+            #     }
+            # ]
+        }).sort("timestamp_local", 1)
+
+        # Convert cursor to list and exclude ObjectId
+        polling_data = [{k: v for k, v in record.items() if k != '_id'} for record in data_cursor]
+        
+        # If no polling data found within the calculated range, return an empty result
+        if not polling_data:
+            return {
+                "store_id": store_id,
+                "filtered_data_table": []
+            }
+
+        # Get business hours for the specific days of the week
+        store_business_hours = business_hours[
+            (business_hours['store_id'] == store_id)
+        ]
+        
+        # If no business hours found for this store on the specified days, return an empty result
+        if store_business_hours.empty:
+            return {
+                "store_id": store_id,
+                "filtered_data_table": []
+            }
+
+        # Extract business hours for the week
+        business_hours_dict = store_business_hours.set_index('day_of_week').to_dict(orient='index')
+        
+        def is_within_business_hours(record):
+            record_time = datetime.strptime(record['timestamp_local'], '%H:%M:%S').time()
+            record_day = int(record['day_of_week'])
+            if record_day in business_hours_dict:
+                business_start = datetime.strptime(business_hours_dict[record_day]['start_time_local'], '%H:%M:%S').time()
+                business_end = datetime.strptime(business_hours_dict[record_day]['end_time_local'], '%H:%M:%S').time()
+                # Check if record_time is within the business hours
+                return business_start <= record_time <= business_end
+            return False
+        
+        # Filter polling data within business hours
+        polling_data_in_business_hours = [record for record in polling_data if is_within_business_hours(record)]
+
+        # Prepare the records to be returned
+        last_week_records = [
+            {
+                "store_id": store_id,
+                "day_of_week": int(record['day_of_week']),
+                "timestamp_local": record['timestamp_local'],
+                "status": record.get('status', 'unknown')  # Assuming 'status' field is present; default to 'unknown'
+            }
+            for record in polling_data_in_business_hours
+        ]
+        if last_week_records:
+            db.last_week_records.insert_many(last_week_records)
+        return {
+            "store_id": store_id,
+            "filtered_data_table": polling_data_in_business_hours
+        }
+
+    except Exception as e:
+        # Print error message and raise HTTPException with a generic internal server error
+        print(f"Error: {e}")
+        raise HTTPException(status_code=500, detail="Internal Server Error")
+
+   
+
 
 
 async def calculate_uptime_downtime_last_hour(store_id: int):
@@ -484,93 +657,161 @@ async def calculate_uptime_downtime_last_day(store_id: int):
     
 
 
-
-    
-async def process_all_polling_data():
+async def calculate_uptime_downtime_last_week(store_id: int):
     try:
-        # Load CSV files
-        polling_data = pd.read_csv("data/store_status.csv")
-        timezones = pd.read_csv("data/store_timezones.csv")
+        # Fetch the filtered data from MongoDB for the last week
+        filtered_data_cursor = db.last_week_records.find({"store_id": store_id}).sort("timestamp_local", 1)
+        filtered_data = [{k: v for k, v in record.items() if k != '_id'} for record in filtered_data_cursor]
 
-        # Convert timestamps
-        polling_data['timestamp_utc'] = pd.to_datetime(polling_data['timestamp_utc'])
+        if not filtered_data:
+            last_week_records =[ {
+                "store_id": store_id,
+                "uptime_hours": 0,
+                "downtime_hours": 0,
+                "estimated_uptime_hours": 0,
+                "estimated_downtime_hours": 0,
+                "full_data": []
+            }]
 
-        # Function to convert UTC to local time and extract the required fields
-        def convert_utc_to_local_time(utc_time, timezone_str):
-            local_tz = pytz.timezone(timezone_str)
-            local_time = utc_time.tz_convert(local_tz)
-            return local_time.strftime('%H:%M:%S'), local_time.weekday()  # Return time up to seconds and day of week
+            if last_week_records:
+                db.up_down_week.insert_many(last_week_records)
 
-        # Process data and add local time and day of week
-        def process_row(row):
-            local_time, day_of_week = convert_utc_to_local_time(
-                row['timestamp_utc'],
-                timezones.loc[timezones['store_id'] == row['store_id'], 'timezone_str'].values[0]
-            )
             return {
-                "store_id": row['store_id'],
-                "timestamp_local": local_time,  # Only time up to seconds
-                "day_of_week": day_of_week,  # Day of the week (0=Monday, 6=Sunday)
-                "status": row['status']
+                "store_id": store_id,
+                "uptime_hours": 0,
+                "downtime_hours": 0,
+                "estimated_uptime_hours": 0,
+                "estimated_downtime_hours": 0,
+                "full_data": []
             }
 
-        # Convert all polling data
-        processed_data = polling_data.apply(process_row, axis=1)
+        # Convert filtered data to DataFrame
+        df = pd.DataFrame(filtered_data)
+        df['timestamp_local'] = pd.to_datetime(df['timestamp_local'], format='%H:%M:%S').dt.time
 
-        # Insert data into MongoDB
-        for data_to_insert in processed_data:
-            result = db.all_polling_data.insert_one(data_to_insert)
-            if not result.inserted_id:
-                raise HTTPException(status_code=500, detail="Failed to insert data")
+        # Define a base date for time calculations
+        base_date = datetime(2000, 1, 1)  # Arbitrary base date
 
-        return {"message": "All data processed and stored in all_polling_data collection in MongoDB"}
-    
+        # Convert time to datetime for calculations
+        df['timestamp_local'] = df['timestamp_local'].apply(lambda t: datetime.combine(base_date, t))
+
+        # Ensure data is sorted by timestamp
+        df = df.sort_values(by='timestamp_local').reset_index(drop=True)
+
+        # Define the start and end of the period
+        start_time = datetime.combine(base_date, datetime.min.time())
+        end_time = start_time + timedelta(days=7)
+
+        # Create a list to hold the full dataset with estimated records
+        full_data = []
+
+        # Add the start_time if it is not in the DataFrame
+        if df['timestamp_local'].iloc[0] > start_time:
+            full_data.append({'timestamp_local': start_time, 'status': df['status'].iloc[0]})
+
+        # Add the actual records
+        for index, row in df.iterrows():
+            full_data.append({'timestamp_local': row['timestamp_local'], 'status': row['status']})
+
+        # Add the end_time if it is not in the DataFrame
+        if df['timestamp_local'].iloc[-1] < end_time:
+            full_data.append({'timestamp_local': end_time, 'status': df['status'].iloc[-1]})
+
+        # Convert full_data list to DataFrame
+        full_df = pd.DataFrame(full_data)
+        full_df['timestamp_local'] = pd.to_datetime(full_df['timestamp_local'])
+
+        # Calculate the time differences between consecutive records
+        full_df['time_diff'] = full_df['timestamp_local'].diff().fillna(pd.Timedelta(seconds=0)).dt.total_seconds() / 3600
+
+        # Calculate uptime and downtime by summing the time differences where status is 'active' or 'inactive'
+        uptime_hours = full_df[full_df['status'] == 'active']['time_diff'].sum()
+        downtime_hours = full_df[full_df['status'] == 'inactive']['time_diff'].sum()
+
+        # Estimate missing data
+        estimated_uptime_hours = 0
+        estimated_downtime_hours = 0
+
+        # Check for gaps between the first record and the start_time
+        if full_df['timestamp_local'].iloc[0] > start_time:
+            time_gap = (full_df['timestamp_local'].iloc[0] - start_time).total_seconds() / 3600
+            if full_df['status'].iloc[0] == 'active':
+                estimated_uptime_hours += time_gap
+            else:
+                estimated_downtime_hours += time_gap
+
+        # Check for gaps between records
+        for i in range(len(full_df) - 1):
+            gap_duration = (full_df['timestamp_local'].iloc[i + 1] - full_df['timestamp_local'].iloc[i]).total_seconds() / 3600
+            if full_df['status'].iloc[i] == 'active':
+                estimated_uptime_hours += gap_duration
+            else:
+                estimated_downtime_hours += gap_duration
+
+        # Check for gaps between the last record and end_time
+        if full_df['timestamp_local'].iloc[-1] < end_time:
+            time_gap = (end_time - full_df['timestamp_local'].iloc[-1]).total_seconds() / 3600
+            if full_df['status'].iloc[-1] == 'active':
+                estimated_uptime_hours += time_gap
+            else:
+                estimated_downtime_hours += time_gap
+
+        # Convert timestamps to string format for the response
+        for record in full_data:
+            record['timestamp_local'] = record['timestamp_local'].strftime('%H:%M:%S')
+
+        last_week_records =[ {
+                "store_id": store_id,
+                "uptime_hours": uptime_hours,
+                "downtime_hours": downtime_hours,
+                "estimated_uptime_hours": estimated_uptime_hours,
+                "estimated_downtime_hours": estimated_downtime_hours,
+                "full_data": full_data
+        }]
+
+        # Store only records that meet all conditions in MongoDB
+        if last_week_records:
+            db.up_down_week.insert_many(last_week_records)
+
+        return {
+            "store_id": store_id,
+            "uptime_hours": uptime_hours,
+            "downtime_hours": downtime_hours,
+            "estimated_uptime_hours": estimated_uptime_hours,
+            "estimated_downtime_hours": estimated_downtime_hours,
+            "full_data": full_data
+        }
+
     except Exception as e:
         print(f"Error: {e}")
         raise HTTPException(status_code=500, detail="Internal Server Error")
 
-async def process_latest_polling_data():
+store_ids_arr=[]
+
+async def extract_store_ids():
+    global store_ids_arr  
     try:
-        # Load CSV files
-        polling_data = pd.read_csv("data/store_status.csv")
-        timezones = pd.read_csv("data/store_timezones.csv")
+        
+        df = pd.read_csv("data/store_status.csv")
 
-        # Convert timestamps
-        polling_data['timestamp_utc'] = pd.to_datetime(polling_data['timestamp_utc'])
 
-        # Ensure only the latest timestamp is kept for each store
-        latest_polling_data = polling_data.sort_values('timestamp_utc').groupby('store_id').tail(1)
+        if 'store_id' not in df.columns:
+            raise ValueError("CSV file must contain a 'store_id' column.")
 
-        # Function to convert UTC to local time and extract the required fields
-        def convert_utc_to_local_time(utc_time, timezone_str):
-            local_tz = pytz.timezone(timezone_str)
-            local_time = utc_time.tz_convert(local_tz)
-            return local_time.strftime('%H:%M:%S'), local_time.weekday()  # Return time up to seconds and day of week
+        
+        store_ids = df['store_id'].unique()
 
-        # Process data and add local time and day of week
-        def process_row(row):
-            local_time, day_of_week = convert_utc_to_local_time(
-                row['timestamp_utc'],
-                timezones.loc[timezones['store_id'] == row['store_id'], 'timezone_str'].values[0]
-            )
-            return {
-                "store_id": row['store_id'],
-                "timestamp_local": local_time,  # Only time up to seconds
-                "day_of_week": day_of_week,  # Day of the week (0=Monday, 6=Sunday)
-                "status": row['status']
-            }
-
-        # Convert only the latest polling data
-        processed_data = latest_polling_data.apply(process_row, axis=1)
-
-        # Insert data into MongoDB
-        for data_to_insert in processed_data:
-            result = db.latest_polling_data.insert_one(data_to_insert)
-            if not result.inserted_id:
-                raise HTTPException(status_code=500, detail="Failed to insert data")
-
-        return {"message": "Latest data processed and stored in latest_polling_data collection in MongoDB"}
     
+        store_ids_arr = store_ids.tolist()  
+
+        return {"store_ids": store_ids_arr}
+
+    except pd.errors.EmptyDataError:
+        raise HTTPException(status_code=500, detail="CSV file is empty.")
+    except pd.errors.ParserError:
+        raise HTTPException(status_code=500, detail="Error parsing CSV file.")
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
         print(f"Error: {e}")
         raise HTTPException(status_code=500, detail="Internal Server Error")
@@ -581,43 +822,49 @@ async def generate_report():
     await process_all_polling_data()
     await process_latest_polling_data()
     
-    # Fetch data to generate the report
-    store_ids = [1, 2, 3]  # Replace with dynamic store IDs if needed
+    
+    if not store_ids_arr:
+        await extract_store_ids()
     final_results = []
 
-    for store_id in store_ids:
-        # Process hourly data
+    for store_id in store_ids_arr:
+        
         await generate_filtered_data_table_last_hour(store_id)
         hour_data = await calculate_uptime_downtime_last_hour(store_id)
         
-        # Process daily data
+
         await generate_filtered_data_table_last_day(store_id)
         day_data = await calculate_uptime_downtime_last_day(store_id)
+
+        await generate_filtered_data_table_last_week(store_id)
+        week_data = await calculate_uptime_downtime_last_week(store_id)
         
-        # Extract necessary fields
+        
         report_entry = {
             "store_id": store_id,
             "uptime_last_hour": hour_data['estimated_uptime_minutes'],
-            "downtime_last_hour": hour_data['estimated_downtime_minutes'],
             "uptime_last_day": day_data['estimated_uptime_hours'],
-            "downtime_last_day": day_data['estimated_downtime_hours']
+            "uptime_last_week": week_data['estimated_uptime_hours'],
+            "downtime_last_hour": hour_data['estimated_downtime_minutes'],
+            "downtime_last_day": day_data['estimated_downtime_hours'],
+            "downtime_last_week": week_data['estimated_downtime_hours']
         }
         
         final_results.append(report_entry)
     
-    # Convert final results to DataFrame
+
     final_report_df = pd.DataFrame(final_results)
     
-    # Generate a unique report ID
+    
     report_id = ''.join(random.choices(string.ascii_letters + string.digits, k=10))
     
-    # Define the file path (current directory)
+    
     file_path = f"{report_id}.csv"
     
-    # Save the final report as a CSV file
+    
     final_report_df.to_csv(file_path, index=False)
     
-    # Save the report status to the database
+    
     db.reports.insert_one({"report_id": report_id, "status": "Complete", "file_path": file_path})
     
     return report_id
