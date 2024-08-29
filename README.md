@@ -46,15 +46,83 @@ We will have 3 sources of data
    uvicorn main:app --reload
 5. **Final API Endpoints**
 
-
-   - /trigger_report endpoint that will trigger report generation from the data provided (stored in DB)
+    ```bash
+   /trigger_report
+    ```
+   - POST /trigger_report endpoint that will trigger report generation from the data provided (stored in DB)
     1. No input 
     2. Output - report_id (random string) 
     3. report_id will be used for polling the status of report completion
-  
-   - /get_report endpoint that will return the status of the report or the csv
+
+    ```bash
+   /get_report
+    ```
+   - GET /get_report endpoint that will return the status of the report or the csv
     1. Input - report_id
     2. Output
         - if report generation is not complete, return “Running” as the output
         - if report generation is complete, return “Complete” along with the CSV file with the schema described above.
+        
+6. **Testing API Endpoints**
 
+    Endpoints used for step by step testing.
+
+     ```bash
+   /process_all_polling_data/
+    ```
+   - POST
+    /process_all_polling_data/
+    To convert all data from store_status.csv from timestamp_utc to local time and also converting date to weekdays, and store it in database.
+    
+    ```bash
+   /process_latest_polling_data/
+    ```
+   - POST
+    /process_latest_polling_data/
+    To convert only the latest timestamp data from store_status.csv from timestamp_utc to local time and also converting date to weekdays, and store it in database.
+    
+    ```bash
+   /stores/filtered_data_last_hour/
+    ```
+    - GET
+    /stores/filtered_data_last_hour
+    To store the data for each store for the last hour(from latest timestamp of that store) and store it in database.
+    
+    ```bash
+   /stores/filtered_data_last_day/
+    ```
+    - GET
+    /stores/filtered_data_last_day
+    To store the data for each store for the last day(from latest timestamp of that store) and store it in database.
+    
+    ```bash
+   /stores/filtered_data_last_week/
+    ```
+    - GET
+    /stores/filtered_data_last_week
+    To store the data for each store for the last week(from latest timestamp of that store) and store it in database.
+    
+    ```bash
+   /stores/uptime_downtime_last_hour/
+    ```
+    - GET
+    /stores/uptime_downtime_last_hour
+    Calculate Uptime Downtime For All Stores Last hour (using interpolation logic to fill missing data for accurate analysis) and store it in database.
+    
+    ```bash
+   /stores/uptime_downtime_last_day/
+    ```
+   - GET
+    /stores/uptime_downtime_last_day
+    Calculate Uptime Downtime For All Stores Last day (using interpolation logic to fill missing data for accurate analysis) and store it in database.
+    
+    ```bash
+   /stores/uptime_downtime_last_week/
+    ```
+   - GET
+    /stores/uptime_downtime_last_week
+    Calculate Uptime Downtime For All Stores Last week (using interpolation logic to fill missing data for accurate analysis) and store it in database.
+    
+    - Using all those tables the final report is created.
+
+   
