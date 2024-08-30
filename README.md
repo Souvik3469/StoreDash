@@ -45,7 +45,7 @@ We will have 3 sources of data
    ```bash
    uvicorn main:app --reload
 5. **Final API Endpoints**
-    Open http://127.0.0.1:8000/docs where all the endpoints can be tested.
+    - Open http://127.0.0.1:8000/docs where all the endpoints can be tested.
     ```bash
    /trigger_report
     ```
